@@ -43,7 +43,7 @@ large numbers of rows.
 # Data Flow
 
 1. The source system performs an export and pushes the export file to an S3 bucket, with a path of
-s3://<BUCKET>/<TENANT>/<TABLE>/<EXPORT_VERSION>/<FILENAME.gz>. This example uses CSV files compressed with GZIP.
+s3://BUCKET/TENANT/TABLE/EXPORT_VERSION/FILENAME.gz. This example uses CSV files compressed with GZIP.
 2. A CloudWatch event triggers, executing an AWS Step Function, passing in the S3 key of the uploaded file.
 3. The AWS Step Function registers the new file in an Amazon DynamoDB table named 'registry'
 4. The AWS Step Function attempts to acquire a lock for the tenant/table pair, to ensure that multiple import jobs 
@@ -62,10 +62,10 @@ query returns all rows.
    Notice below, when you copy the files, keep the directory structure intact, but omit the **data** directory. the
    top-level directory in your S3 bucket should be the name/id of a tenant, in our case the tenant name/id is just 'tenant'.
 
-    a. Add **data/tenant/test_table/20201230_V0001/export1.csv.gz** to **s3://<BUCKET>/tenant/test_table/20201230_V0001/export1.csv.gz** 
+    a. Add **data/tenant/test_table/20201230_V0001/export1.csv.gz** to **s3://BUCKET/tenant/test_table/20201230_V0001/export1.csv.gz** 
     
-    b. Add **data/tenant/test_table/20201230_V0002/export2.csv.gz** to **s3://<BUCKET>/tenant/test_table/20201230_V0002/export2.csv.gz**
+    b. Add **data/tenant/test_table/20201230_V0002/export2.csv.gz** to **s3://BUCKET/tenant/test_table/20201230_V0002/export2.csv.gz**
      
-    c. Add **data/tenant/test_table/20201231_V0001/export3.csv.gz** to **s3://<BUCKET>/tenant/test_table/20201231_V0001/export3.csv.gz**
+    c. Add **data/tenant/test_table/20201231_V0001/export3.csv.gz** to **s3://BUCKET/tenant/test_table/20201231_V0001/export3.csv.gz**
     
 3. Examine the CloudWatch logs for the publish-updates function to see statistics on records written to the Amazon Kinesis stream   
