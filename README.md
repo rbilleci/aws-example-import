@@ -53,6 +53,12 @@ query returns all rows.
 6. An AWS Lambda function reads the results from the Amazon Athena query, and writes those to an Amazon Kinesis stream
 7. This step is up to you. You need to read the data from the stream, and write the operations to your data source.
 
+The following image depicts the flow:
+
+![alt text](documentation/stepfunction_graph.svg "Data Import Step Function")
+
+
+
 # Testing it out
 
 1. Run the cfn.yaml to deploy the infrastructure. Provide an S3 bucket name where import files will be uploaded
