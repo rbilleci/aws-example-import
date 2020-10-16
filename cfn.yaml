@@ -1,0 +1,840 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Parameters:
+
+  ImportBucketName:
+    Type: String
+    Description: Bucket Name for importing files to
+
+  ImportFileExtension:
+    Type: String
+    Default: .gz
+
+  UpdateStreamShards:
+    Type: Number
+    Default: 4
+    Description: >
+      The number of Amazon Kinesis shards use import data into dynamo db.
+      A higher value will improve throughput when processing multiple tenants or tables
+      at a time, but will incur a higher expense.
+      Please refer to Amazon Kinesis shard pricing.
+    MinValue: 1
+    MaxValue: 128
+
+  UpdateStreamBatchSize:
+    Type: Number
+    Default: 250
+    Description: >
+      The number of records from an Amazon Kinesis stream we attempt to read and
+      import into Amazon DynamoDB table.
+    MinValue: 25
+    MaxValue: 10000
+
+  UpdateTableAttempts:
+    Type: Number
+    Default: 10
+    Description: The maximum number of times we attempt to import data into Amazon DynamoDB.
+    MinValue: -1
+    MaxValue: 10000
+
+Resources:
+
+  ImportBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref ImportBucketName
+      LifecycleConfiguration:
+        Rules:
+          - Id: ia-transition
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+            NoncurrentVersionTransitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt Import.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: !Ref ImportFileExtension
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  AthenaResultBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      LifecycleConfiguration:
+        Rules:
+          - Id: ia-transition
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+            NoncurrentVersionTransitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+
+  Registry:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: registry
+      BillingMode: PAY_PER_REQUEST
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+        - AttributeName: version
+          KeyType: RANGE
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: version
+          AttributeType: S
+
+  Locks:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: locks
+      BillingMode: PAY_PER_REQUEST
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+        - AttributeName: lock_owner
+          KeyType: RANGE
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: lock_owner
+          AttributeType: S
+      TimeToLiveSpecification:
+        Enabled: true
+        AttributeName: ttl
+
+
+  # Lambda Function to Trigger State Machine ---------------------------------------------------------------------------
+
+  Import:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: import
+      Handler: index.lambda_handler
+      Role: !GetAtt ImportRole.Arn
+      Runtime: python3.7
+      Timeout: 60
+      Environment:
+        Variables:
+          SM_ARN: !Sub ${ImportProcess.Arn}
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+
+          def lambda_handler(event, context):
+            stepfunctions = boto3.client('stepfunctions')
+            for record in event['Records']:
+              stepfunctions.start_execution(stateMachineArn = os.environ['SM_ARN'], input = json.dumps(record['s3']['object']))
+            return
+
+  ImportPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Import
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub arn:aws:s3:::${ImportBucketName}
+
+  ImportRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ lambda.amazonaws.com ]
+            Action: [ sts:AssumeRole ]
+      Path: "/"
+      Policies:
+        - PolicyName: import-role-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: [ logs:CreateLogStream, logs:CreateLogGroup, logs:DescribeLogGroups, logs:PutLogEvents ]
+                Resource: "*"
+              - Effect: Allow
+                Action: [ states:StartExecution ]
+                Resource: !Ref ImportProcess
+
+
+  # Execute the Import State Machine -----------------------------------------------------------------------------------
+
+  ImportProcess:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: import-process
+      RoleArn: !GetAtt ImportProcessRole.Arn
+      DefinitionString: !Sub |-
+        {
+          "StartAt": "RegisterFile",
+          "States": {
+           "RegisterFile": {
+              "Type": "Task",
+              "Resource": "${RegisterFile.Arn}",
+              "Next": "AcquireLock"
+            },
+           "AcquireLock": {
+              "Type": "Task",
+              "Resource": "${AcquireLock.Arn}",
+              "Next": "LockedAcquired?"
+            },
+            "LockedAcquired?": {
+              "Type": "Choice",
+              "Choices": [{
+                     "Variable": "$.locked",
+                     "BooleanEquals": true,
+                     "Next": "ComputeDelta"
+                 },
+                 {
+                     "Variable": "$.locked",
+                     "BooleanEquals": false,
+                     "Next": "AwaitLock"
+                 }],
+              "Default": "ReleaseLock"
+            },
+            "AwaitLock": {
+              "Type": "Wait",
+              "Seconds": 10,
+              "Next": "AcquireLock"
+            },
+            "ComputeDelta": {
+              "Type": "Task",
+              "Resource": "${ComputeDelta.Arn}",
+              "Next": "AwaitDelta"
+            },
+            "AwaitDelta": {
+              "Type": "Wait",
+              "Seconds": 3,
+              "Next": "GetComputeDeltaStatus"
+            },
+            "GetComputeDeltaStatus": {
+               "Type": "Task",
+               "Resource": "${GetComputeDeltaStatus.Arn}",
+               "Next": "DeltaComputed?"
+             },
+            "DeltaComputed?": {
+              "Type": "Choice",
+              "Choices": [{
+                     "Variable": "$.query_state",
+                     "StringEquals": "SUCCEEDED",
+                     "Next": "PublishUpdates"
+                 },
+                 {
+                     "Variable": "$.query_state",
+                     "StringEquals": "QUEUED",
+                     "Next": "AwaitDelta"
+                 },
+                 {
+                     "Variable": "$.query_state",
+                     "StringEquals": "RUNNING",
+                     "Next": "AwaitDelta"
+                 }],
+              "Default": "ReleaseLock"
+            },
+            "PublishUpdates": {
+               "Type": "Task",
+               "Resource": "${PublishUpdates.Arn}",
+               "Next": "ReleaseLock"
+             },
+            "ReleaseLock": {
+               "Type": "Task",
+               "Resource": "${ReleaseLock.Arn}",
+               "Next": "Done"
+             },
+            "Done": {
+              "Type": "Pass",
+              "End": true
+            }
+          }
+        }
+
+  ImportProcessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ !Sub "states.${ AWS::Region }.amazonaws.com" ]
+            Action: sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: import-process-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: [ logs:CreateLogStream, logs:CreateLogGroup, logs:DescribeLogGroups, logs:PutLogEvents ]
+                Resource: "*"
+              - Effect: Allow
+                Action: [ lambda:InvokeFunction ]
+                Resource: "*"
+
+  # Lambda Function to register the file -------------------------------------------------------------------------------
+
+  RegisterFile:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: register-file
+      Handler: index.lambda_handler
+      Role: !GetAtt RegisterFileRole.Arn
+      Runtime: python3.7
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import uuid
+
+          def lambda_handler(event, context):
+            print(event)
+            request_id = str(uuid.uuid4())
+            s3_key = event['key']
+            split = s3_key.split("/")
+            tenant = split[0]
+            table = split[1]
+            id = f"{tenant}/{table}"
+            version = split[2]
+            path = f"{split[0]}/{split[1]}/{split[2]}/"
+            file = split[3]
+
+            boto3.client('dynamodb').put_item(
+              TableName = 'registry',
+              ConditionExpression = 'attribute_not_exists(version)',
+              Item = {
+                'id': {'S': id},
+                'version': {'S': str(version)},
+                's3_key': {'S': s3_key},
+                'path': {'S': path},
+                'file': {'S': file},
+                'size': {'N': str(event['size'])},
+                'etag': {'S': event['eTag']} })
+            return {  "request_id": request_id, "id": id, "version": version, "path": path, "s3_key": s3_key, "tenant": tenant, "table": table }
+
+  RegisterFileRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ lambda.amazonaws.com ]
+            Action: [ sts:AssumeRole ]
+      Path: "/"
+      Policies:
+        - PolicyName: register-file-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: [ logs:CreateLogStream, logs:CreateLogGroup, logs:DescribeLogGroups, logs:PutLogEvents ]
+                Resource: "*"
+              - Effect: Allow
+                Action: [ dynamodb:PutItem ]
+                Resource: !GetAtt Registry.Arn
+
+
+  # Lambda function to acquire a ddb lock ------------------------------------------------------------------------------
+
+  AcquireLock:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: acquire-lock
+      Handler: index.lambda_handler
+      Role: !GetAtt AcquireLockRole.Arn
+      Runtime: python3.7
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import datetime
+          import time
+          from botocore.exceptions import ClientError
+
+          def lambda_handler(event, context):
+            request_id = event['request_id']
+            id = event['id']
+            ttl = int(time.time()) + 36000 # 10 hour TTL
+
+            try:
+              boto3.client('dynamodb').put_item(
+                TableName = 'locks',
+                ConditionExpression = 'attribute_not_exists(lock_owner)',
+                Item = {
+                  'id': {'S': id},
+                  'lock_owner': {'S': request_id},
+                  'ttl': {'N': str(ttl)}
+                })
+              event['locked'] = True
+            except ClientError as e:
+              if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+                event['locked'] = False
+            return event
+
+  AcquireLockRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ lambda.amazonaws.com ]
+            Action: [ sts:AssumeRole ]
+      Path: "/"
+      Policies:
+        - PolicyName: acquire-lock-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: [ logs:CreateLogStream, logs:CreateLogGroup, logs:DescribeLogGroups, logs:PutLogEvents ]
+                Resource: "*"
+              - Effect: Allow
+                Action: [ dynamodb:PutItem ]
+                Resource: !GetAtt Locks.Arn
+
+
+  # Lambda function to call athena and compute delta of functions ------------------------------------------------------
+
+  ComputeDelta:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: compute-delta
+      Handler: index.lambda_handler
+      Role: !GetAtt ComputeDeltaRole.Arn
+      Runtime: python3.7
+      Timeout: 900
+      Environment:
+        Variables:
+          ATHENA_IMPORT_BUCKET: !Ref ImportBucketName
+          ATHENA_RESULT_BUCKET: !Ref AthenaResultBucket
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import datetime
+          import time
+
+          athena = boto3.client('athena')
+          import_location = f"s3://{os.environ['ATHENA_IMPORT_BUCKET']}"
+          output_location = f"s3://{os.environ['ATHENA_RESULT_BUCKET']}"
+
+          def lambda_handler(event, context):
+            print(event)
+            tenant = event['tenant']
+            db_name = 'db_' + tenant
+            id = event['id']
+            table = event['table']
+            version_new = event['version']
+
+            version_old = get_latest_version(id, version_new)
+            if version_old == None:
+              create_db(tenant, db_name)
+              create_table(tenant, db_name, table, version_new)
+              event['query_id'] = compute_import(db_name, table, version_new)
+            elif version_old < version_new:
+              create_db(tenant, db_name)
+              create_table(tenant, db_name, table, version_old)
+              create_table(tenant, db_name, table, version_new)
+              event['query_id'] = compute_import_delta(db_name, table, version_old, version_new)
+            else:
+              event['query_id'] = None # TODO: add handling in the workflow for this case!
+
+            return event
+
+          def get_latest_version(id, version):
+            response = boto3.client('dynamodb').query(
+              TableName = 'registry',
+              KeyConditionExpression = 'id = :id',
+              FilterExpression = 'processing_status = :processing_status',
+              ExpressionAttributeValues = {
+                ':id': {'S': id},
+                ':processing_status': {'S': 'SUCCEEDED'}
+              },
+              ScanIndexForward=False
+            )
+            if response['Items']:
+              for item in response['Items']:
+                if item['version']['S'] != version:
+                  return item['version']['S']
+            return None
+
+          def create_db(tenant, db_name):
+            query = f"CREATE DATABASE IF NOT EXISTS {db_name} LOCATION '{import_location}/{tenant}';"
+            wait_for(execute(query))
+
+          def create_table(tenant, db_name, table, version):
+            query = f"""
+              CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}.{table}_{version} (
+                PK STRING,
+                COL_1 INT,
+                COL_2 STRING,
+                COL_3 STRING
+              )
+              ROW FORMAT DELIMITED FIELDS TERMINATED BY ';' STORED AS TEXTFILE
+              LOCATION '{import_location}/{tenant}/{table}/{version}';
+              """
+            wait_for(execute(query))
+
+
+          def compute_import(db_name, table, version_new):
+            query = f"SELECT 'INSERT' as dynamo_op, new.* FROM {db_name}.{table}_{version_new} new "
+            return execute(query)
+
+          def compute_import_delta(db_name, table, version_old, version_new):
+            query = f"""
+              SELECT 'DELETE' as dynamo_op, old.*
+                FROM {db_name}.{table}_{version_old} old
+                WHERE NOT EXISTS
+                (SELECT 1 FROM {db_name}.{table}_{version_new} new WHERE new.PK = old.PK)
+
+              UNION
+
+              SELECT 'INSERT' as dynamo_op, new.*
+                FROM {db_name}.{table}_{version_new} new
+                WHERE NOT EXISTS
+                (SELECT 1 FROM {db_name}.{table}_{version_old} old WHERE new.PK = old.PK)
+
+              UNION
+
+              SELECT 'UPDATE' as dynamo_op, new.*
+                FROM {db_name}.{table}_{version_new} new
+                WHERE EXISTS
+                (
+                SELECT 1 FROM {db_name}.{table}_{version_old} old
+                  WHERE new.PK = old.PK  AND
+              	  (cast(old.col_1 AS varchar) || ':::' ||
+              	   cast(old.col_2 AS varchar) || ':::' ||
+              	   cast(old.col_3 AS varchar))
+              	  <>
+              	  (cast(new.col_1 AS varchar) || ':::' ||
+              	   cast(new.col_2 AS varchar) || ':::' ||
+              	   cast(new.col_3 AS varchar))
+                )
+              """
+            return execute(query)
+
+          def execute(query):
+            return athena.start_query_execution(
+              QueryString = query,
+              ResultConfiguration = { 'OutputLocation': output_location })['QueryExecutionId']
+
+          def wait_for(query_id):
+            loop_until = datetime.datetime.now() + datetime.timedelta(minutes=5)
+            while datetime.datetime.now() <= loop_until:
+              state = athena.get_query_execution(QueryExecutionId = query_id)['QueryExecution']['Status']['State']
+              if state == 'QUEUED' or state == 'RUNNING':
+                print(f"awaiting completion of query {query_id}")
+                time.sleep(1)
+              else:
+                return
+
+  ComputeDeltaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ lambda.amazonaws.com ]
+            Action: [ sts:AssumeRole ]
+      Path: "/"
+      Policies:
+        - PolicyName: compute-delta-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: [ logs:CreateLogStream, logs:CreateLogGroup, logs:DescribeLogGroups, logs:PutLogEvents ]
+                Resource: "*"
+              - Effect: Allow
+                Action: [ athena:* ] # TODO: narrow permissions
+                Resource: !Sub arn:aws:athena:${AWS::Region}:${AWS::AccountId}:*/*
+              - Effect: Allow
+                Action: [ s3:* ] # TODO: narrow permissions
+                Resource:
+                  - !Sub arn:aws:s3:::${ImportBucketName}
+                  - !Sub arn:aws:s3:::${ImportBucketName}/*
+              - Effect: Allow
+                Action: [ s3:* ] # TODO: narrow permissions
+                Resource:
+                  - !GetAtt AthenaResultBucket.Arn
+                  - !Sub ${AthenaResultBucket.Arn}/*
+              - Effect: Allow
+                Action: [ glue:* ] # TODO: narrow permissions
+                Resource: !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+              - Effect: Allow
+                Action: [ glue:* ] # TODO: narrow permissions
+                Resource: !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/*
+              - Effect: Allow
+                Action: [ glue:* ] # TODO: narrow permissions
+                Resource: !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/*/*
+              - Effect: Allow
+                Action: [ dynamodb:Query ]
+                Resource: !GetAtt Registry.Arn
+
+  GetComputeDeltaStatus:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: get-compute-delta-status
+      Handler: index.lambda_handler
+      Role: !GetAtt GetComputeDeltaStatusRole.Arn
+      Runtime: python3.7
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+
+          def lambda_handler(event, context):
+            print(event)
+            state = boto3.client('athena').get_query_execution(
+              QueryExecutionId = event['query_id'])['QueryExecution']['Status']['State']
+            event['query_state'] = state
+            return event
+
+  GetComputeDeltaStatusRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ lambda.amazonaws.com ]
+            Action: [ sts:AssumeRole ]
+      Path: "/"
+      Policies:
+        - PolicyName: compute-delta-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: [ logs:CreateLogStream, logs:CreateLogGroup, logs:DescribeLogGroups, logs:PutLogEvents ]
+                Resource: "*"
+              - Effect: Allow
+                Action: [ athena:GetQueryExecution ]
+                Resource: !Sub arn:aws:athena:${AWS::Region}:${AWS::AccountId}:*/*
+
+  # Lambda function to publish rows to kinesis stream ------------------------------------------------------------------
+
+  PublishUpdates:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: publish-updates
+      Handler: index.lambda_handler
+      Role: !GetAtt PublishUpdatesRole.Arn
+      Runtime: python3.7
+      MemorySize: 1024
+      Timeout: 900
+      Code:
+        ZipFile: |
+          import boto3
+
+          athena = boto3.client('athena')
+          kinesis = boto3.client('kinesis')
+          batch_size = 100 # Note: should be tuned dynamically based on the data read, since the buffer size per kinesis call is 1 MB
+
+          def lambda_handler(event, context):
+            print(event)
+
+            shard = event['id']
+            token = None
+            while True:
+              response = None
+              if token:
+                response = athena.get_query_results(QueryExecutionId=event['query_id'], NextToken=token, MaxResults=batch_size)
+              else:
+                response = athena.get_query_results(QueryExecutionId=event['query_id'], MaxResults=batch_size)
+
+              publish(shard, response['ResultSet']['Rows'])
+
+              if 'NextToken' in response:
+                token = response['NextToken']
+              else:
+                break
+            return event
+
+          def publish(shard, rows):
+            records = []
+            for row in rows:
+              records.append({'Data': str(row), 'PartitionKey': shard})
+            print(f"publishing {len(rows)} records")
+            #kinesis.put_records(StreamName='update-stream', Records=records)
+
+
+
+  PublishUpdatesRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ lambda.amazonaws.com ]
+            Action: [ sts:AssumeRole ]
+      Path: "/"
+      Policies:
+        - PolicyName: publish-updates-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: [ logs:CreateLogStream, logs:CreateLogGroup, logs:DescribeLogGroups, logs:PutLogEvents ]
+                Resource: "*"
+              - Effect: Allow
+                Action: [ kinesis:PutRecord, kinesis:PutRecords ]
+                Resource: !GetAtt UpdateStream.Arn
+              - Effect: Allow
+                Action: [ athena:GetQueryResults ]
+                Resource: !Sub arn:aws:athena:${AWS::Region}:${AWS::AccountId}:*/*
+              - Effect: Allow
+                Action: [ s3:* ] # TODO: narrow permissions
+                Resource:
+                  - !GetAtt AthenaResultBucket.Arn
+                  - !Sub ${AthenaResultBucket.Arn}/*
+  # Lambda function to release locks -----------------------------------------------------------------------------------
+
+  ReleaseLock:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: release-lock
+      Handler: index.lambda_handler
+      Role: !GetAtt ReleaseLockRole.Arn
+      Runtime: python3.7
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+
+          def lambda_handler(event, context):
+            update_state(event)
+            release_lock(event)
+            return event
+
+          def update_state(event):
+            state = event['query_state']
+            if state == None:
+              state = 'NONE'
+            boto3.client('dynamodb').update_item(
+              TableName = 'registry',
+              Key = {'id': {'S': event['id']}, 'version': {'S': event['version']}},
+              AttributeUpdates = {'processing_status': {'Value': {'S': state}, 'Action': 'PUT'}})
+
+          def release_lock(event):
+            boto3.client('dynamodb').delete_item(
+              TableName = 'locks',
+              Key = {'id': {'S': event['id']}, 'lock_owner': {'S': event['request_id']}})
+
+  ReleaseLockRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ lambda.amazonaws.com ]
+            Action: [ sts:AssumeRole ]
+      Path: "/"
+      Policies:
+        - PolicyName: release-lock-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: [ logs:CreateLogStream, logs:CreateLogGroup, logs:DescribeLogGroups, logs:PutLogEvents ]
+                Resource: "*"
+              - Effect: Allow
+                Action: [ dynamodb:DeleteItem ]
+                Resource: !GetAtt Locks.Arn
+              - Effect: Allow
+                Action: [ dynamodb:UpdateItem ]
+                Resource: !GetAtt Registry.Arn
+
+
+  # Kinesis Stream -----------------------------------------------------------------------------------------------------
+
+  UpdateStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: update-stream
+      RetentionPeriodHours: 168
+      ShardCount: !Ref UpdateStreamShards
+
+  UpdateMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: !Ref UpdateStreamBatchSize
+      BisectBatchOnFunctionError: true
+      Enabled: true
+      EventSourceArn: !GetAtt UpdateStream.Arn
+      FunctionName: !Ref UpdateTable
+      MaximumRetryAttempts: !Ref UpdateTableAttempts
+      ParallelizationFactor: 1 # Parallelization infeasible as sequential jobs in the same stream and may overlap
+      StartingPosition: LATEST
+      # DestinationConfig TODO: define error queue
+
+  UpdateTable:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: update-table
+      Handler: index.lambda_handler
+      Role: !GetAtt UpdateTableRole.Arn
+      Runtime: python3.7
+      Timeout: 900
+      Code:
+        ZipFile: |
+          import boto3
+
+          def lambda_handler(event, context):
+            print(event)
+            kinesis = boto3.client('kinesis')
+
+            return { "statusCode": 200 }
+
+  UpdateTableRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ lambda.amazonaws.com ]
+            Action: [ sts:AssumeRole ]
+      Path: "/"
+      Policies:
+        - PolicyName: update-table-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: [ logs:CreateLogStream, logs:CreateLogGroup, logs:DescribeLogGroups, logs:PutLogEvents ]
+                Resource: "*"
+              - Effect: Allow
+                Action: [ kinesis:GetRecords, kinesis:GetShardIterator, kinesis:DescribeStream, kinesis:ListStreams ]
+                Resource: !GetAtt UpdateStream.Arn
