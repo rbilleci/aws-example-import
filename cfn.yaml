@@ -682,7 +682,8 @@ Resources:
             for row in rows:
               records.append({'Data': str(row), 'PartitionKey': shard})
             print(f"publishing {len(rows)} records")
-            #kinesis.put_records(StreamName='update-stream', Records=records)
+            kinesis.put_records(StreamName='update-stream', Records=records)
+
 
 
 
