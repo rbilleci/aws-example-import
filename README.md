@@ -32,12 +32,12 @@ be changed to use any column or even a composite primary key.
 
 ### Limitations of example
 
-This example demonstrates the end-to-end flow from Amazon S3 to an Amazon Kinesis stream.
+* This example demonstrates the end-to-end flow from Amazon S3 to an Amazon Kinesis stream.
 Each record written to the stream has an operation (INSERT, UPDATE, DELETE).  
 To write the changes to a database, you must add an AWS Lambda function to read the operations from the stream.
-
-The **publish-updates** function in this example must be optimized to avoid potential timeouts when working with
-large numbers of rows.
+* The **publish-updates** function in this example must be optimized to avoid potential timeouts when working with
+large numbers of rows. One approach could be to a.) write the results to multiple files, using CTAS https://docs.aws.amazon.com/athena/latest/ug/bucketing-vs-partitioning.html,
+then have the writing of each file handled with a separate call to AWS Lambda from the AWS Step Function.
 
 
 # Data Flow
